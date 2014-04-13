@@ -1,0 +1,775 @@
+BEGIN;
+
+
+CREATE SCHEMA auditor;
+
+
+CREATE FUNCTION auditor.get_custom_data() RETURNS hstore AS $$
+BEGIN
+  -- RETURN HSTORE('username', get_session_var('USERNAME'));
+  RETURN NULL::hstore;
+END;
+$$ LANGUAGE plpgsql VOLATILE;
+
+
+CREATE TABLE auditor.auditor_log (
+  auditor_log_sid BIGSERIAL PRIMARY KEY,
+  relation_id OID,
+  schema_name NAME NOT NULL,
+  table_name NAME NOT NULL,
+  operation VARCHAR(8) NOT NULL,
+  old_rec HSTORE,
+  rec HSTORE,
+  pg_user NAME NOT NULL DEFAULT CURRENT_USER,
+  ip INET DEFAULT INET_CLIENT_ADDR(),
+  process_id INT DEFAULT PG_BACKEND_PID(),
+  session_start TIMESTAMP,
+  aux_data HSTORE DEFAULT auditor.GET_CUSTOM_DATA(),
+  transaction_id BIGINT NOT NULL DEFAULT TXID_CURRENT(),
+  transaction_datetime TIMESTAMP NOT NULL DEFAULT TRANSACTION_TIMESTAMP(),
+  clock_datetime TIMESTAMP NOT NULL DEFAULT CLOCK_TIMESTAMP()
+);
+
+CREATE INDEX auditor_txid_idx ON auditor.auditor_log (transaction_id);
+CREATE INDEX auditor_txdate_idx ON auditor.auditor_log (transaction_datetime);
+CREATE INDEX auditor_process_idx ON auditor.auditor_log (process_id);
+
+
+CREATE TYPE auditor.operation_row AS (
+  relation_id OID,
+  operation VARCHAR(8),
+  transaction_id BIGINT,
+  rec HSTORE,
+  old_rec HSTORE
+);
+
+
+CREATE OR REPLACE FUNCTION auditor.auditor_logger() RETURNS trigger AS $$
+  DECLARE
+    old_data hstore;
+    new_data hstore;
+    sess_start timestamp;
+  BEGIN
+    IF (TG_OP = 'INSERT') THEN
+      new_data := HSTORE(NEW.*);
+    ELSIF (TG_OP = 'UPDATE') THEN
+      new_data := HSTORE(NEW.*);
+      old_data := HSTORE(OLD.*);
+    ELSIF (TG_OP = 'DELETE') THEN
+      old_data := HSTORE(OLD.*);
+    END IF;
+
+    SELECT
+      backend_start
+    FROM
+      pg_stat_activity
+    WHERE
+      procpid = PG_BACKEND_PID()
+    INTO
+      sess_start;
+
+    INSERT INTO auditor.auditor_log
+      (relation_id, schema_name, table_name, operation, old_rec, rec, session_start)
+    VALUES
+      (TG_RELID, TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_OP, old_data, new_data, sess_start);
+
+    RETURN NEW;
+  END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+
+
+
+CREATE OR REPLACE FUNCTION auditor.get_primary_key(name, name) RETURNS SETOF information_schema.sql_identifier
+  AS
+$$
+  SELECT
+    column_name
+  FROM
+    information_schema.constraint_column_usage AS ccu INNER JOIN information_schema.table_constraints AS tc
+  ON
+    ccu.constraint_schema=tc.constraint_schema AND ccu.constraint_name=tc.constraint_name AND ccu.table_schema=tc.table_schema AND ccu.table_name=tc.table_name
+  WHERE
+    tc.table_schema=$1
+  AND
+    tc.table_name=$2
+  AND
+    tc.constraint_type='PRIMARY KEY';
+$$
+  LANGUAGE SQL STABLE STRICT;
+
+
+
+CREATE OR REPLACE FUNCTION auditor.cancel("row" auditor.operation_row) RETURNS BOOLEAN AS $$
+DECLARE
+  rel_name text;
+  v_table_name name;
+  v_schema_name name;
+BEGIN
+  IF row.operation = 'TRUNCATE' THEN
+    RAISE EXCEPTION 'Truncate operation detected in transaction %', row.transaction_id;
+  END IF;
+
+  -- todo: check for update of the PK itself
+
+  SELECT INTO v_schema_name, v_table_name
+    s.nspname,
+    t.relname
+  FROM
+    pg_catalog.pg_class AS t INNER JOIN pg_catalog.pg_namespace AS s
+  ON
+    t.relnamespace = s.oid
+  WHERE
+    t.oid = row.relation_id;
+
+  rel_name := QUOTE_IDENT(v_schema_name) || '.' || QUOTE_IDENT(v_table_name);
+
+  IF row.operation = 'INSERT' OR row.operation = 'UPDATE' THEN
+
+    DECLARE
+      where_clause TEXT;
+
+    BEGIN
+
+      EXECUTE
+        'SELECT
+           STRING_AGG(pk || '' = (NULL::'||rel_name||' #= $1).'' || pk, '' AND '')
+        FROM
+          auditor.GET_PRIMARY_KEY($1, $2) AS pk'
+      INTO
+        where_clause
+      USING
+        v_schema_name, v_table_name;
+
+      IF where_clause IS NULL THEN
+        RAISE NOTICE 'No primary key found for relation %.% (action skipped)', v_schema_name, v_table_name;
+        RETURN FALSE;
+      END IF;
+
+      IF row.operation = 'INSERT' THEN
+      
+        EXECUTE
+          'DELETE FROM ' || rel_name || ' WHERE ' || where_clause
+        USING
+          row.rec;
+          
+      ELSE
+
+        DECLARE
+          list text;
+          rec_list text;
+
+        BEGIN
+
+          SELECT INTO list, rec_list
+            STRING_AGG(column_name, ','),
+            STRING_AGG('(NULL::'||rel_name||' #= $1).'||column_name, ',')
+          FROM
+            information_schema.columns
+          WHERE
+            table_schema = v_schema_name
+          AND
+            table_name = v_table_name;
+
+          EXECUTE
+            'UPDATE ' || rel_name || ' SET ('||list||') = ('||rec_list||') WHERE ' || where_clause
+          USING
+            row.old_rec;
+
+        END;
+      
+      END IF;
+
+    END;
+
+  ELSE
+   
+    EXECUTE
+      'INSERT INTO '||rel_name||' SELECT (NULL::'||rel_name||' #= $1).*'
+    USING
+      row.old_rec;
+
+  END IF;
+
+  RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql STRICT;
+
+
+CREATE OR REPLACE FUNCTION auditor.cancel(bigint) RETURNS bigint AS $$
+  DECLARE
+    row auditor.operation_row;
+    v_rows_processed bigint default 0;
+
+  BEGIN
+    SET CONSTRAINTS ALL DEFERRED;
+
+    FOR row IN
+      SELECT
+        relation_id,
+        operation,
+        transaction_id,
+        rec,
+        old_rec
+      FROM
+        auditor.auditor_log
+      WHERE
+        transaction_id = $1
+      ORDER BY
+        auditor_log_sid DESC
+    LOOP
+
+      PERFORM auditor.cancel(row);
+
+      v_rows_processed := v_rows_processed + 1;
+
+    END LOOP;
+
+    RETURN v_rows_processed;
+  END;
+$$ LANGUAGE plpgsql STRICT;
+
+
+
+-- add everywhere as second argument schema+table name to operate only over that relation?
+
+CREATE OR REPLACE FUNCTION auditor.flashback(bigint) RETURNS bigint AS $$
+  DECLARE
+    row auditor.operation_row;
+    v_rows_processed bigint default 0;
+
+  BEGIN
+    SET CONSTRAINTS ALL DEFERRED;
+
+    FOR row IN
+      SELECT
+        relation_id,
+        operation,
+        transaction_id,
+        rec,
+        old_rec
+      FROM
+        auditor.auditor_log
+      WHERE
+        transaction_id > $1
+      ORDER BY
+        auditor_log_sid DESC
+    LOOP
+
+      PERFORM auditor.cancel(row);
+
+      v_rows_processed := v_rows_processed + 1;
+
+    END LOOP;
+
+    RETURN v_rows_processed;
+  END;
+$$ LANGUAGE plpgsql STRICT;
+
+
+
+
+CREATE OR REPLACE FUNCTION auditor.flashback(timestamp) RETURNS bigint AS $$
+  DECLARE
+    v_txid bigint;
+  BEGIN
+    IF $1 >= NOW() THEN
+      RAISE EXCEPTION 'Travelling into the future is not allowed!';
+    END IF;
+
+    SELECT
+      MAX(transaction_id)
+    FROM
+      auditor.auditor_log
+    WHERE
+      transaction_datetime < $1
+    INTO
+      v_txid;
+
+    IF v_txid IS NULL THEN
+      RAISE NOTICE 'Timestamp too far into the past.';
+      RETURN 0;
+    ELSE
+      RETURN auditor.flashback(v_txid);
+    END IF;
+  END;
+$$ LANGUAGE plpgsql STRICT;
+
+
+
+
+
+CREATE OR REPLACE FUNCTION auditor.undo(steps bigint default 1, override_others boolean default false) RETURNS bigint AS $$
+  DECLARE
+    v_txid bigint;
+    row auditor.operation_row;
+    v_rows_processed bigint default 0;
+
+  BEGIN
+    SET CONSTRAINTS ALL DEFERRED;
+
+    steps := ABS(steps);
+
+    IF steps = 0 THEN
+      steps = 1;
+    END IF;
+
+    EXECUTE
+      'SELECT
+         DISTINCT transaction_id
+       FROM
+         auditor.auditor_log
+       WHERE
+         process_id = PG_BACKEND_PID()
+       AND
+         session_start = (
+           SELECT
+             backend_start
+           FROM
+             pg_stat_activity
+           WHERE
+             procpid = PG_BACKEND_PID()
+         )
+       ORDER BY
+         transaction_id DESC
+       LIMIT
+         1
+       OFFSET
+         $1'
+    INTO
+      v_txid
+    USING
+      $1 - 1;
+
+    IF v_txid IS NULL THEN
+      RAISE EXCEPTION 'There weren''t % DML transaction(s) yet in this session.', steps;
+    END IF;
+
+    IF override_others THEN
+      FOR row IN
+        SELECT
+          relation_id,
+          operation,
+          transaction_id,
+          rec,
+          old_rec
+        FROM
+          auditor.auditor_log
+        WHERE
+          transaction_id >= v_txid
+        ORDER BY
+          auditor_log_sid DESC
+      LOOP
+        PERFORM auditor.cancel(row);
+        v_rows_processed := v_rows_processed + 1;
+      END LOOP;
+    ELSE
+      FOR row IN
+        SELECT
+          relation_id,
+          operation,
+          transaction_id,
+          rec,
+          old_rec
+        FROM
+          auditor.auditor_log
+        WHERE
+          transaction_id >= v_txid
+        AND
+          process_id = PG_BACKEND_PID()
+        AND
+          session_start = (
+            SELECT
+              backend_start
+            FROM
+              pg_stat_activity
+            WHERE
+              procpid = PG_BACKEND_PID()
+          )
+        ORDER BY
+          auditor_log_sid DESC
+      LOOP
+        PERFORM auditor.cancel(row);
+        v_rows_processed := v_rows_processed + 1;
+      END LOOP;
+    END IF;
+
+    RETURN v_rows_processed;
+  END;
+$$ LANGUAGE plpgsql STRICT;
+
+
+CREATE OR REPLACE FUNCTION auditor.is_array(anyelement) RETURNS BOOLEAN AS $$
+  SELECT typelem<>'0' AND typarray='0' FROM pg_type WHERE oid=pg_typeof($1);
+$$ LANGUAGE sql IMMUTABLE STRICT;
+
+
+CREATE TYPE auditor.evolution_row AS (
+  transaction_id bigint,
+  clock_datetime timestamp,
+  operation varchar(8),
+  old text,
+  new text
+);
+
+
+CREATE OR REPLACE FUNCTION auditor.evolution(p_schema_name name, p_table_name name, p_field_name name, pk_value anyelement) RETURNS SETOF auditor.evolution_row AS $$
+  DECLARE
+    pk_keys TEXT[];
+    pk_count INT;
+    query TEXT DEFAULT 'SELECT
+                          transaction_id,
+                          clock_datetime,
+                          operation,
+                          old_rec->$3,
+                          rec->$3
+                        FROM
+                          auditor.auditor_log
+                        WHERE
+                          schema_name = $1
+                        AND
+                          table_name = $2
+                        AND
+                          (old_rec->$4 = $5 OR rec->$4 = $5)
+                        ORDER BY
+                          clock_datetime';
+  BEGIN
+    SELECT
+      ARRAY_AGG(pk::text),
+      COUNT(pk)
+    FROM
+      auditor.GET_PRIMARY_KEY(p_schema_name, p_table_name) AS pk
+    INTO
+      pk_keys,
+      pk_count;
+
+    IF pk_count = 0 THEN
+      RAISE EXCEPTION 'No primary key found for relation %.%', p_schema_name, p_table_name;
+    ELSIF pk_count = 1 THEN
+      IF auditor.IS_ARRAY(pk_value) THEN
+        RAISE EXCEPTION 'Relation %.% has a single primary key, scalar value expected for parameter #4', p_schema_name, p_table_name;
+      END IF;
+
+      RETURN QUERY EXECUTE
+        query
+      USING
+        p_schema_name, p_table_name, p_field_name, pk_keys[1], pk_value::text;
+      
+    ELSE
+      IF NOT auditor.IS_ARRAY(pk_value) THEN
+        RAISE EXCEPTION 'Relation %.% has a compound primary key, array expected for parameter #4', p_schema_name, p_table_name;
+      END IF;
+
+      RETURN QUERY EXECUTE
+        query
+      USING
+        p_schema_name, p_table_name, p_field_name, pk_keys, pk_value;
+
+    END IF;
+  END;
+$$ LANGUAGE plpgsql STRICT;
+
+
+
+CREATE OR REPLACE FUNCTION auditor.purge() RETURNS void AS $$
+  TRUNCATE auditor.auditor_log;
+$$ LANGUAGE SQL;
+
+
+CREATE OR REPLACE FUNCTION auditor.uninstall() RETURNS void AS $$
+  DROP SCHEMA auditor CASCADE;
+$$ LANGUAGE SQL;
+
+
+CREATE OR REPLACE FUNCTION auditor.attach(p_schema_name name default null, p_table_name name default null) RETURNS boolean AS $$
+  DECLARE
+    rel_name TEXT;
+    row RECORD;
+  BEGIN
+    IF p_schema_name IS NULL THEN
+      FOR row IN
+        SELECT
+          table_schema,
+          table_name
+        FROM
+          information_schema.tables
+        WHERE
+          table_schema != 'pg_catalog' AND table_schema != 'information_schema' AND table_schema != 'auditor'
+        AND
+          table_type = 'BASE TABLE'
+      LOOP
+
+        PERFORM auditor.attach(row.table_schema, row.table_name);
+
+      END LOOP;
+
+      RETURN TRUE;
+    ELSIF p_table_name IS NULL THEN
+      FOR row IN
+        SELECT
+          table_schema,
+          table_name
+        FROM
+          information_schema.tables
+        WHERE
+          table_schema != 'pg_catalog' AND table_schema != 'information_schema' AND table_schema != 'auditor'
+        AND
+          table_type = 'BASE TABLE'
+        AND
+          table_schema = p_schema_name
+      LOOP
+
+        PERFORM auditor.attach(row.table_schema, row.table_name);
+
+      END LOOP;
+
+      RETURN TRUE;
+    END IF;
+
+    rel_name := quote_ident(p_schema_name) || '.' || quote_ident(p_table_name);
+
+    BEGIN
+      EXECUTE 
+        'CREATE TRIGGER
+          auditor_logger
+        AFTER INSERT OR UPDATE OR DELETE ON
+          '||rel_name||'
+        FOR EACH ROW EXECUTE PROCEDURE
+          auditor.auditor_logger()';
+
+      EXECUTE
+        'CREATE TRIGGER
+          auditor_logger_truncate
+        AFTER TRUNCATE ON
+          '||rel_name||'
+        FOR EACH STATEMENT EXECUTE PROCEDURE
+          auditor.auditor_logger()';
+
+    EXCEPTION WHEN OTHERS THEN
+      RAISE EXCEPTION '%', SQLERRM;
+    END;
+
+    RETURN TRUE;
+  END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE FUNCTION auditor.detach(p_schema_name name default null, p_table_name name default null) RETURNS boolean AS $$
+  DECLARE
+    rel_name TEXT;
+    row RECORD;
+  BEGIN
+    IF p_schema_name IS NULL THEN
+      FOR row IN
+        SELECT
+          table_schema,
+          table_name
+        FROM
+          information_schema.tables
+        WHERE
+          table_schema != 'pg_catalog' AND table_schema != 'information_schema' AND table_schema != 'auditor'
+        AND
+          table_type = 'BASE TABLE'
+      LOOP
+        BEGIN
+          PERFORM auditor.detach(row.table_schema, row.table_name);
+        EXCEPTION WHEN OTHERS THEN
+          -- trigger doesn't exist -> there's nothing left to do
+        END;
+      END LOOP;
+
+      RETURN TRUE;
+    ELSIF p_table_name IS NULL THEN
+      FOR row IN
+        SELECT
+          table_schema,
+          table_name
+        FROM
+          information_schema.tables
+        WHERE
+          table_schema != 'pg_catalog' AND table_schema != 'information_schema' AND table_schema != 'auditor'
+        AND
+          table_type = 'BASE TABLE'
+        AND
+          table_schema = p_schema_name
+      LOOP
+        BEGIN
+          PERFORM auditor.detach(row.table_schema, row.table_name);
+        EXCEPTION WHEN OTHERS THEN
+          -- trigger doesn't exist -> there's nothing left to do
+        END;
+      END LOOP;
+
+      RETURN TRUE;
+    END IF;
+
+    rel_name := quote_ident(p_schema_name) || '.' || quote_ident(p_table_name);
+
+    BEGIN
+      EXECUTE 
+        'DROP TRIGGER
+          auditor_logger
+        ON
+          '||rel_name;
+
+      EXECUTE 
+        'DROP TRIGGER
+          auditor_logger_truncate
+        ON
+          '||rel_name;
+
+    EXCEPTION WHEN OTHERS THEN
+      RAISE EXCEPTION '%', SQLERRM;
+    END;
+
+    RETURN TRUE;
+  END;
+$$ LANGUAGE plpgsql;
+
+
+
+
+CREATE OR REPLACE FUNCTION auditor.auditor_stop_truncate() RETURNS trigger AS $$
+  BEGIN
+    RAISE EXCEPTION 'Truncate operation forbidden.';
+
+    RETURN NULL;
+  END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+
+
+
+CREATE OR REPLACE FUNCTION auditor.forbid_truncate(p_schema_name name default null, p_table_name name default null) RETURNS boolean AS $$
+  DECLARE
+    row RECORD;
+    rel_name TEXT;
+  BEGIN
+    IF p_schema_name IS NULL THEN
+      FOR row IN
+        SELECT
+          table_schema,
+          table_name
+        FROM
+          information_schema.tables
+        WHERE
+          table_schema != 'pg_catalog' AND table_schema != 'information_schema' AND table_schema != 'auditor'
+        AND
+          table_type = 'BASE TABLE'
+      LOOP
+
+        PERFORM auditor.forbid_truncate(row.table_schema, row.table_name);
+
+      END LOOP;
+
+      RETURN TRUE;
+    ELSIF p_table_name IS NULL THEN
+      FOR row IN
+        SELECT
+          table_schema,
+          table_name
+        FROM
+          information_schema.tables
+        WHERE
+          table_schema != 'pg_catalog' AND table_schema != 'information_schema' AND table_schema != 'auditor'
+        AND
+          table_type = 'BASE TABLE'
+        AND
+          table_schema = p_schema_name
+      LOOP
+
+        PERFORM auditor.forbid_truncate(row.table_schema, row.table_name);
+
+      END LOOP;
+
+      RETURN TRUE;
+    END IF;
+
+    rel_name := quote_ident(p_schema_name) || '.' || quote_ident(p_table_name);
+
+    BEGIN
+      EXECUTE
+        'CREATE TRIGGER
+          auditor_forbid_truncate
+        BEFORE TRUNCATE ON
+          '||rel_name||'
+        FOR EACH STATEMENT EXECUTE PROCEDURE
+          auditor.auditor_stop_truncate()';
+
+    EXCEPTION WHEN OTHERS THEN
+      RAISE EXCEPTION '%', SQLERRM;
+    END;
+
+    RETURN TRUE;
+  END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE FUNCTION auditor.allow_truncate(p_schema_name name default null, p_table_name name default null) RETURNS boolean AS $$
+  DECLARE
+    row RECORD;
+    rel_name TEXT;
+  BEGIN
+    IF p_schema_name IS NULL THEN
+      FOR row IN
+        SELECT
+          table_schema,
+          table_name
+        FROM
+          information_schema.tables
+        WHERE
+          table_schema != 'pg_catalog' AND table_schema != 'information_schema' AND table_schema != 'auditor'
+        AND
+          table_type = 'BASE TABLE'
+      LOOP
+        BEGIN
+          PERFORM auditor.allow_truncate(row.table_schema, row.table_name);
+        EXCEPTION WHEN OTHERS THEN
+          -- trigger doesn't exist -> there's nothing left to do
+        END;
+      END LOOP;
+
+      RETURN TRUE;
+    ELSIF p_table_name IS NULL THEN
+      FOR row IN
+        SELECT
+          table_schema,
+          table_name
+        FROM
+          information_schema.tables
+        WHERE
+          table_schema != 'pg_catalog' AND table_schema != 'information_schema' AND table_schema != 'auditor'
+        AND
+          table_type = 'BASE TABLE'
+        AND
+          table_schema = p_schema_name
+      LOOP
+        BEGIN
+          PERFORM auditor.allow_truncate(row.table_schema, row.table_name);
+        EXCEPTION WHEN OTHERS THEN
+          -- trigger doesn't exist -> there's nothing left to do
+        END;
+      END LOOP;
+
+      RETURN TRUE;
+    END IF;
+
+    rel_name := quote_ident(p_schema_name) || '.' || quote_ident(p_table_name);
+
+    BEGIN
+      EXECUTE
+        'DROP TRIGGER
+          auditor_forbid_truncate
+        ON
+          '||rel_name;
+
+    EXCEPTION WHEN OTHERS THEN
+      RAISE EXCEPTION '%', SQLERRM;
+    END;
+
+    RETURN TRUE;
+  END;
+$$ LANGUAGE plpgsql;
+
+
+COMMIT;
