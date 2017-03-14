@@ -1,5 +1,0 @@
-# pgauditor extension
-comment = 'Log each DML statement and provide transactions flashback ability'
-default_version = 'AUDITOR_VERSION'
-module_pathname = '$libdir/pgauditor'
-relocatable = false
