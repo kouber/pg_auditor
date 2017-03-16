@@ -436,11 +436,6 @@ END;
 $$ LANGUAGE plpgsql STRICT;
 
 
-CREATE FUNCTION @extschema@.purge() RETURNS void AS $$
-  TRUNCATE @extschema@.log;
-$$ LANGUAGE SQL;
-
-
 CREATE FUNCTION attach(relname regclass) RETURNS boolean AS $$
 BEGIN
   BEGIN
