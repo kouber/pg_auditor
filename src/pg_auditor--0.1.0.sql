@@ -19,7 +19,7 @@ CREATE TABLE log (
   old_rec hstore,
   rec hstore,
   pg_user name NOT NULL DEFAULT CURRENT_USER,
-  application_name text,
+  application_name text DEFAULT CURRENT_SETTING('application_name'),
   ip inet DEFAULT INET_CLIENT_ADDR(),
   process_id int DEFAULT PG_BACKEND_PID(),
   session_start timestamp,
@@ -51,7 +51,6 @@ DECLARE
   old_data hstore;
   new_data hstore;
   sess_start timestamp;
-  app_name text;
 BEGIN
   IF (TG_OP = 'INSERT') THEN
     new_data := HSTORE(NEW.*);
@@ -69,15 +68,10 @@ BEGIN
   WHERE
     pid = PG_BACKEND_PID();
 
-  BEGIN
-    app_name := CURRENT_SETTING('application_name');
-  EXCEPTION WHEN others THEN
-  END;
-
   INSERT INTO @extschema@.log
-    (relation_id, schema_name, table_name, operation, old_rec, rec, session_start, application_name)
+    (relation_id, schema_name, table_name, operation, old_rec, rec, session_start)
   VALUES
-    (TG_RELID, TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_OP::@extschema@.operation, old_data, new_data, sess_start, app_name);
+    (TG_RELID, TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_OP::@extschema@.operation, old_data, new_data, sess_start);
 
   RETURN NEW;
 END;
