@@ -42,7 +42,7 @@ CREATE TYPE operation_row AS (
   operation @extschema@.operation,
   transaction_id bigint,
   new_rec hstore,
-  old_new_rec hstore
+  old_rec hstore
 );
 
 
