@@ -1,5 +1,5 @@
 # pg_auditor extension
-comment = 'Log each DML statement and provide flashback ability'
+comment = 'Audit data changes and provide flashback ability'
 default_version = '0.2'
 requires = 'hstore'
 relocatable = false
