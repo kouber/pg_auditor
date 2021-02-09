@@ -1,0 +1,38 @@
+{
+  "name": "pg_auditor",
+  "abstract": "Auditing extension that records each data modification statement and allows partial or complete flashback of transactions.",
+  "description": "pg_auditor provides an interface to put specific tables under audit monitoring, by keeping log of every change of the data being made (by either INSERT, UPDATE or DELETE statements). When all the three data modification statements are recorded, it is possible to make a complete transaction flashback, thus restoring the data to a previous state.",
+  "version": "0.2.0",
+  "maintainer": "Kouber Saparev <kouber@gmail.com>",
+  "license": "bsd",
+  "tags": [ "pg_auditor", "audit", "audit log", "auditing", "log", "logging", "flashback", "transaction flashback", "rollback" ],
+  "prereqs": {
+    "runtime": {
+      "requires": {
+        "hstore": 0
+      }
+    }
+  },
+  "provides": {
+    "pg_auditor": {
+      "file": "src/pg_auditor--0.2.sql",
+      "docfile": "README.md",
+      "version": "0.2.0",
+      "abstract": "Record DML statements"
+    }
+  },
+  "resources": {
+    "repository": {
+      "url":  "https://github.com/kouber/pg_auditor.git",
+      "web":  "https://github.com/kouber/pg_auditor/",
+      "type": "git"
+    },
+    "bugtracker": {
+      "web": "https://github.com/kouber/pg_auditor/issues"
+    }
+  },
+  "meta-spec": {
+    "version": "1.0.0",
+    "url": "http://pgxn.org/meta/spec.txt"
+  }
+}

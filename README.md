@@ -4,7 +4,7 @@ PostgreSQL auditing extension that records each data modification statement of s
 
 ## Description ##
 
-`pg_auditor` provides an interface to dynamically put specific tables under audit monitoring, by keeping log of every change of the data being made (by either INSERT, UPDATE or DELETE statements). When all the three data modification statements are recorded, it is possible to make a complete transaction flashback, thus restoring the data to a previous state.
+`pg_auditor` provides an interface to put specific tables under audit monitoring, by keeping log of every change of the data being made (by either INSERT, UPDATE or DELETE statements). When all the three data modification statements are recorded, it is possible to make a complete transaction flashback, thus restoring the data to a previous state.
 
 ## Prerequisites ##
 
