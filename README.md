@@ -23,7 +23,7 @@ The functions below are used to specify which tables should be put under audit c
 
 ### Flashback functions ###
 
-Flashing back of transactions is made by replaying the audit log in a reverse order. Restoring data to a previous state will be applied only for the tables under audit control. If all the tables are put under control. then all the data will be restored.
+Flashing back of transactions is made by replaying the audit log in a reverse order. Restoring data to a previous state will be applied only for the tables under audit control. If all the tables are put under control, then all the data will be restored.
 
 * `auditor.undo([steps[, override others]])` - undoes the last _steps_ transactions within the current session. If the second argument is set to _true_, then the process will go out of the current session scope, thus overriding concurrent transaction actions.
 * `auditor.cancel(transaction bigint)` - undoes the actions made within the specified transaction.
