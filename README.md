@@ -16,8 +16,12 @@ The `hstore` extension is required in order to store table row versions.
 
 The functions below are used to specify which tables should be put under audit control. Each one of them requires a _SHARE ROW EXCLUSIVE_ lock over the table, so be careful when dealing with write busy tables and use appropriate _lock timeout_ setting if necessary.
 
-* `auditor.attach(regclass [, INSERT [, UPDATE [, DELETE [, TRUNCATE ]]]])` - puts the specified table under audit control. The optional variadic argument(s) could be passed to indicate which statement(s) to be recorded. By default all the data modification statements are logged.
+* `auditor.attach(regclass [, dml text[] [, columns name[]]])` - puts the specified table under audit control. The second argument indicates which statement(s) to be recorded: INSERT, UPDATE, DELETE, or TRUNCATE. The third argument specifies which columns to audit. By default all the modification statements over all the columns are logged.
 * `auditor.detach(regclass)` - removes the specified table from audit control.
+* `auditor.attach_statement(regclass, statement)` - adds data modification language statement to the list of actions for the table.
+* `auditor.detach_statement(regclass, statement)` - removes data modification language statement from the list of actions for the table.
+* `auditor.attach_column(regclass, column_name)` - appends table column to the list of audited columns.
+* `auditor.detach_column(regclass, column_name)` - removes table column from the list of audited columns.
 * `auditor.forbid_truncate(regclass)` - protects the specified table from truncate commands, which are impossible to audit or flashback.
 * `auditor.allow_truncate(regclass)` - removes truncate protection from the specified table.
 
