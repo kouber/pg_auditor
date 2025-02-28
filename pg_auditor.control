@@ -1,6 +1,6 @@
 # pg_auditor extension
 comment = 'Audit data changes and provide flashback ability'
-default_version = '0.2'
+default_version = '0.3'
 requires = 'hstore'
 relocatable = false
 schema = 'auditor'

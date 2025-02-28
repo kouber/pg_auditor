@@ -10,40 +10,27 @@ $$ LANGUAGE plpgsql VOLATILE;
 CREATE TYPE operation AS ENUM ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE');
 
 
-CREATE TABLE catalog (
-  id          serial    PRIMARY KEY,
-  relation_id oid,
-  schema_name name      NOT NULL,
-  table_name  name      NOT NULL,
-  operations  @extschema@.operation[] NOT NULL,
-  columns     name[],
-  audit_start timestamp NOT NULL DEFAULT NOW()
-  audit_end   timestamp,
-  is_active   boolean   NOT NULL DEFAULT TRUE
-);
-
-
 CREATE TABLE log (
-  id                   bigserial PRIMARY KEY,
-  relation_id          oid,
-  schema_name          name      NOT NULL,
-  table_name           name      NOT NULL,
-  operation            @extschema@.operation NOT NULL,
-  old_rec              hstore,
-  new_rec              hstore,
-  pg_user              name      NOT NULL DEFAULT CURRENT_USER,
-  application_name     text      DEFAULT CURRENT_SETTING('application_name'),
-  ip                   inet      DEFAULT INET_CLIENT_ADDR(),
-  process_id           int       DEFAULT PG_BACKEND_PID(),
-  session_start        timestamp,
-  aux_data             hstore    DEFAULT @extschema@.get_custom_data(),
-  transaction_id       bigint    NOT NULL DEFAULT TXID_CURRENT(),
+  id bigserial PRIMARY KEY,
+  relation_id oid,
+  schema_name name NOT NULL,
+  table_name name NOT NULL,
+  operation @extschema@.operation NOT NULL,
+  old_rec hstore,
+  new_rec hstore,
+  pg_user name NOT NULL DEFAULT SESSION_USER,
+  application_name text DEFAULT CURRENT_SETTING('application_name'),
+  ip inet DEFAULT INET_CLIENT_ADDR(),
+  process_id int DEFAULT PG_BACKEND_PID(),
+  session_start timestamp,
+  aux_data hstore DEFAULT @extschema@.get_custom_data(),
+  transaction_id bigint NOT NULL DEFAULT TXID_CURRENT(),
   transaction_datetime timestamp NOT NULL DEFAULT TRANSACTION_TIMESTAMP(),
-  clock_datetime       timestamp NOT NULL DEFAULT CLOCK_TIMESTAMP()
+  clock_datetime timestamp NOT NULL DEFAULT CLOCK_TIMESTAMP()
 );
 
-CREATE INDEX auditor_txid_idx    ON log (transaction_id);
-CREATE INDEX auditor_txdate_idx  ON log (transaction_datetime);
+CREATE INDEX auditor_txid_idx ON log (transaction_id);
+CREATE INDEX auditor_txdate_idx ON log (transaction_datetime);
 CREATE INDEX auditor_process_idx ON log (process_id);
 
 SELECT pg_catalog.pg_extension_config_dump('log', '');
@@ -51,11 +38,11 @@ SELECT pg_catalog.pg_extension_config_dump('log_id_seq', '');
 
 
 CREATE TYPE operation_row AS (
-  relation_id    oid,
-  operation      @extschema@.operation,
+  relation_id oid,
+  operation @extschema@.operation,
   transaction_id bigint,
-  new_rec        hstore,
-  old_rec        hstore
+  new_rec hstore,
+  old_rec hstore
 );
 
 
@@ -450,7 +437,7 @@ END;
 $$ LANGUAGE plpgsql STRICT;
 
 
-CREATE FUNCTION attach(relname regclass, dml text[] default null, columns name[] default null) RETURNS boolean AS $$
+CREATE FUNCTION attach(relname regclass, variadic dml text[] default null) RETURNS boolean AS $$
 DECLARE
   cmd text;
   sql text default 'INSERT OR UPDATE OR DELETE';
@@ -480,35 +467,13 @@ BEGIN
       sql = ARRAY_TO_STRING(dml, ' OR ');
     END IF;
 
-    IF columns IS NOT NULL THEN
-      -- TODO: when x is distinct from y
-      -- logger(params)
-      sql_when := '';
-    END IF;
-
     EXECUTE FORMAT(
       'CREATE TRIGGER
         auditor_logger
       AFTER %s ON
         %s
-      FOR EACH ROW
-        %s
-      EXECUTE PROCEDURE
-        @extschema@.logger()',
-      sql,
-      relname,
-      sql_when
-    );
-
-    -- TODO: ...
-    EXECUTE FORMAT('
-      INSERT INTO @extschema@.catalog
-        ()
-      VALUES
-        ()
-      ON CONFLICT UPDATE
-        is_active = TRUE
-    ');
+      FOR EACH ROW EXECUTE PROCEDURE
+        @extschema@.logger()', sql, relname);
 
   EXCEPTION WHEN OTHERS THEN
     RAISE EXCEPTION '%', SQLERRM;
@@ -559,7 +524,7 @@ BEGIN
       'CREATE TRIGGER
         auditor_forbid_truncate
       BEFORE TRUNCATE ON
-        %I
+        %s
       FOR EACH STATEMENT EXECUTE PROCEDURE
         @extschema@.auditor_abort_truncate()', relname);
 
@@ -579,7 +544,7 @@ BEGIN
       'DROP TRIGGER
         auditor_forbid_truncate
       ON
-        %I', relname);
+        %s', relname);
 
   EXCEPTION WHEN OTHERS THEN
     RAISE EXCEPTION '%', SQLERRM;
